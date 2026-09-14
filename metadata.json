@@ -1,0 +1,6 @@
+{
+  "name": "Web SSH Terminal",
+  "description": "A modern web-based SSH client to connect to remote servers, execute commands in real time, run scripts, monitor server stats, and manage files via SFTP.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
