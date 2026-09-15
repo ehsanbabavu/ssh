@@ -30,22 +30,33 @@ import {
   Radio,
   Eye,
   EyeOff,
+  Bookmark,
+  BookmarkPlus,
+  History,
+  Sparkles,
+  Check,
+  X,
 } from 'lucide-react';
 import { TERMINAL_THEMES, DEFAULT_QUICK_MACROS } from '../data/constants';
 import { VirtualBashShell } from '../utils/virtualShell';
-import type { SSHConfig, SSHTestResult } from '../types';
+import type { SSHConfig, SSHTestResult, SavedCommand } from '../types';
 
 interface TerminalViewProps {
   config?: SSHConfig | null;
   savedConfigs?: SSHConfig[];
+  isVisible?: boolean;
   onDisconnect?: () => void;
   onConnectRemote?: (config: SSHConfig) => void;
   onSaveConfig?: (config: SSHConfig) => void;
 }
 
+const STORAGE_SAVED_COMMANDS_KEY = 'ssh_terminal_saved_commands_v1';
+const STORAGE_COMMAND_HISTORY_KEY = 'ssh_terminal_cmd_history_v1';
+
 export const TerminalView: React.FC<TerminalViewProps> = ({
   config,
   savedConfigs = [],
+  isVisible = true,
   onDisconnect,
   onConnectRemote,
   onSaveConfig,
@@ -81,12 +92,64 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   const [testResult, setTestResult] = useState<SSHTestResult | null>(null);
 
   // Display Controls
-  const [themeId, setThemeId] = useState<string>('github-light');
+  const [themeId, setThemeId] = useState<string>('pure-black');
   const [fontSize, setFontSize] = useState<number>(14);
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
   const [quickInput, setQuickInput] = useState<string>('');
   const [showMacrosMenu, setShowMacrosMenu] = useState<boolean>(false);
   const [reconnectCounter, setReconnectCounter] = useState<number>(0);
+
+  // Saved Commands and Command History state
+  const [savedCommands, setSavedCommands] = useState<SavedCommand[]>(() => {
+    try {
+      const stored = localStorage.getItem(STORAGE_SAVED_COMMANDS_KEY);
+      if (stored) return JSON.parse(stored);
+    } catch (e) {}
+    return [
+      { id: 'sc-1', command: 'uname -a && uptime && free -h', title: 'اطلاعات سیستم و رم', createdAt: Date.now(), useCount: 3 },
+      { id: 'sc-2', command: 'df -h', title: 'بررسی فضای دیسک', createdAt: Date.now(), useCount: 2 },
+      { id: 'sc-3', command: 'ps aux --sort=-%cpu | head -n 10', title: 'پردازش‌های پرمصرف', createdAt: Date.now(), useCount: 1 },
+      { id: 'sc-4', command: 'docker ps -a', title: 'کانتینرهای داکر', createdAt: Date.now(), useCount: 1 },
+      { id: 'sc-5', command: 'sudo journalctl -n 40 --no-pager', title: 'لاگ‌های اخیر سیستم', createdAt: Date.now(), useCount: 1 },
+    ];
+  });
+
+  const [cmdHistory, setCmdHistory] = useState<string[]>(() => {
+    try {
+      const stored = localStorage.getItem(STORAGE_COMMAND_HISTORY_KEY);
+      if (stored) return JSON.parse(stored);
+    } catch (e) {}
+    return [
+      'uname -a && uptime && free -h',
+      'df -h',
+      'free -m',
+      'ps aux --sort=-%cpu | head -n 10',
+      'docker ps',
+      'netstat -tuln',
+      'uptime',
+    ];
+  });
+
+  const [historyNavIndex, setHistoryNavIndex] = useState<number>(-1);
+  const [showSavedModal, setShowSavedModal] = useState<boolean>(false);
+  const [saveSuccessNotice, setSaveSuccessNotice] = useState<boolean>(false);
+  const [selectedSuggestionIndex, setSelectedSuggestionIndex] = useState<number>(-1);
+  const [isInputFocused, setIsInputFocused] = useState<boolean>(false);
+
+  const commandInputRef = useRef<HTMLInputElement>(null);
+
+  // Save to local storage on changes
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_SAVED_COMMANDS_KEY, JSON.stringify(savedCommands));
+    } catch (e) {}
+  }, [savedCommands]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(STORAGE_COMMAND_HISTORY_KEY, JSON.stringify(cmdHistory));
+    } catch (e) {}
+  }, [cmdHistory]);
 
   // Local shell state references
   const currentLineRef = useRef<string>('');
@@ -95,7 +158,21 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
   // Sync prop changes
   useEffect(() => {
     if (config) {
-      setCurrentSSHConfig(config);
+      setCurrentSSHConfig((prev) => {
+        // Prevent reconnecting if it's the exact same server config ID and credentials
+        if (
+          prev &&
+          prev.id === config.id &&
+          prev.host === config.host &&
+          prev.port === config.port &&
+          prev.username === config.username &&
+          prev.password === config.password &&
+          prev.privateKey === config.privateKey
+        ) {
+          return prev;
+        }
+        return config;
+      });
       setHost(config.host);
       setPort(config.port || 22);
       setUsername(config.username);
@@ -118,8 +195,9 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       fontSize,
       fontFamily:
         'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
-      cursorBlink: true,
-      cursorStyle: 'block',
+      cursorBlink: false,
+      cursorStyle: 'bar',
+      disableStdin: true,
       theme: themeObj,
       allowProposedApi: true,
       scrollback: 8000,
@@ -143,6 +221,7 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     let ws: WebSocket | null = null;
     let onDataDisposable: { dispose: () => void } | null = null;
     let onResizeDisposable: { dispose: () => void } | null = null;
+    let pingInterval: NodeJS.Timeout | null = null;
 
     if (terminalMode === 'ssh') {
       if (currentSSHConfig && currentSSHConfig.host && currentSSHConfig.username) {
@@ -179,6 +258,13 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
               rows: term.rows,
             })
           );
+
+          // Heartbeat ping every 10 seconds to keep WebSocket and SSH connection alive while in background/SFTP
+          pingInterval = setInterval(() => {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+              ws.send(JSON.stringify({ type: 'ping' }));
+            }
+          }, 10000);
         };
 
         ws.onmessage = (event) => {
@@ -395,6 +481,9 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     resizeObserver.observe(containerRef.current);
 
     return () => {
+      if (pingInterval) {
+        clearInterval(pingInterval);
+      }
       onDataDisposable?.dispose();
       onResizeDisposable?.dispose();
       resizeObserver.disconnect();
@@ -418,6 +507,18 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       } catch (e) {}
     }
   }, [themeId, fontSize]);
+
+  // Refit terminal whenever becoming visible
+  useEffect(() => {
+    if (isVisible && fitAddonRef.current) {
+      const timer = setTimeout(() => {
+        try {
+          fitAddonRef.current?.fit();
+        } catch (e) {}
+      }, 50);
+      return () => clearTimeout(timer);
+    }
+  }, [isVisible]);
 
   // Handle Connect to External SSH
   const handleConnectSSH = (e?: React.FormEvent) => {
@@ -520,12 +621,106 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
     }
   };
 
-  const handleQuickSubmit = (e: React.FormEvent) => {
-    e.preventDefault();
-    if (!quickInput.trim()) return;
-    runCommandLine(quickInput.trim());
+  const handleQuickSubmit = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    const cmd = quickInput.trim();
+    if (!cmd) return;
+
+    // Record in command history
+    setCmdHistory((prev) => {
+      const filtered = prev.filter((item) => item !== cmd);
+      return [cmd, ...filtered].slice(0, 50);
+    });
+    setHistoryNavIndex(-1);
+
+    // Update useCount if in savedCommands
+    setSavedCommands((prev) =>
+      prev.map((sc) => (sc.command === cmd ? { ...sc, useCount: (sc.useCount || 0) + 1 } : sc))
+    );
+
+    runCommandLine(cmd);
     setQuickInput('');
+    setSelectedSuggestionIndex(-1);
   };
+
+  const handleSaveCurrentCommand = () => {
+    const cmd = quickInput.trim();
+    if (!cmd) return;
+    const exists = savedCommands.some((sc) => sc.command === cmd);
+    if (!exists) {
+      const newSaved: SavedCommand = {
+        id: `sc-${Date.now()}`,
+        command: cmd,
+        title: cmd.slice(0, 30),
+        createdAt: Date.now(),
+        useCount: 1,
+      };
+      setSavedCommands((prev) => [newSaved, ...prev]);
+    }
+    setSaveSuccessNotice(true);
+    setTimeout(() => setSaveSuccessNotice(false), 2200);
+  };
+
+  const handleKeyDownInCommandInput = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    // Arrow Up / Down for History or Suggestions
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (cmdHistory.length === 0) return;
+      const nextIdx = historyNavIndex + 1 < cmdHistory.length ? historyNavIndex + 1 : historyNavIndex;
+      setHistoryNavIndex(nextIdx);
+      if (cmdHistory[nextIdx]) {
+        setQuickInput(cmdHistory[nextIdx]);
+      }
+    } else if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (historyNavIndex > 0) {
+        const prevIdx = historyNavIndex - 1;
+        setHistoryNavIndex(prevIdx);
+        setQuickInput(cmdHistory[prevIdx]);
+      } else if (historyNavIndex === 0) {
+        setHistoryNavIndex(-1);
+        setQuickInput('');
+      }
+    } else if (e.key === 'Escape') {
+      setIsInputFocused(false);
+      setSelectedSuggestionIndex(-1);
+    }
+  };
+
+  // Compute matched suggestions from history and saved commands
+  const suggestedCommands = React.useMemo(() => {
+    const query = quickInput.trim().toLowerCase();
+    const map = new Map<string, { command: string; title?: string; isSaved?: boolean; count?: number }>();
+
+    // Add saved commands
+    savedCommands.forEach((sc) => {
+      map.set(sc.command, {
+        command: sc.command,
+        title: sc.title,
+        isSaved: true,
+        count: sc.useCount || 1,
+      });
+    });
+
+    // Add history commands
+    cmdHistory.forEach((cmd) => {
+      if (!map.has(cmd)) {
+        map.set(cmd, {
+          command: cmd,
+          isSaved: false,
+        });
+      }
+    });
+
+    const all = Array.from(map.values());
+    if (!query) {
+      // return top 6 most relevant/used
+      return all.slice(0, 6);
+    }
+    return all
+      .filter((item) => item.command.toLowerCase().includes(query) || item.title?.toLowerCase().includes(query))
+      .slice(0, 7);
+  }, [quickInput, savedCommands, cmdHistory]);
 
   const sendControlKey = (key: string) => {
     const term = terminalRef.current;
@@ -663,6 +858,19 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
               )}
             </>
           )}
+
+          {/* Saved Commands Button */}
+          <button
+            onClick={() => setShowSavedModal(true)}
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-lg bg-amber-50 hover:bg-amber-100 text-amber-900 border border-amber-200 transition-colors cursor-pointer text-xs font-semibold"
+            title="دستورات ذخیره شده"
+          >
+            <Bookmark className="w-3.5 h-3.5 text-amber-600" />
+            <span className="hidden sm:inline">دستورات ذخیره‌شده</span>
+            <span className="bg-amber-200/80 text-amber-800 text-[10px] px-1.5 py-0.2 rounded-full font-mono font-bold">
+              {savedCommands.length}
+            </span>
+          </button>
 
           {/* Quick Macros Dropdown */}
           <div className="relative">
@@ -914,24 +1122,24 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
       )}
 
       {/* Terminal Viewport */}
-      <div className="flex-1 w-full relative bg-slate-50/50 p-2 overflow-hidden dir-ltr">
+      <div className="flex-1 w-full relative bg-[#090d16] p-2 overflow-hidden dir-ltr">
         <div ref={containerRef} className="w-full h-full" />
 
         {/* Overlay when SSH Disconnected & No Config */}
         {terminalMode === 'ssh' && !currentSSHConfig && (
-          <div className="absolute inset-0 bg-white/95 backdrop-blur-xs flex flex-col items-center justify-center p-6 text-center z-10 dir-rtl">
-            <div className="w-14 h-14 bg-blue-50 border border-blue-100 rounded-2xl flex items-center justify-center mb-4 text-blue-600 shadow-xs">
+          <div className="absolute inset-0 bg-[#090d16]/95 backdrop-blur-xs flex flex-col items-center justify-center p-6 text-center z-10 dir-rtl text-slate-100">
+            <div className="w-14 h-14 bg-slate-900 border border-slate-700 rounded-2xl flex items-center justify-center mb-4 text-sky-400 shadow-lg">
               <Server className="w-7 h-7" />
             </div>
-            <h3 className="text-base font-bold text-slate-800 mb-1">
+            <h3 className="text-base font-bold text-white mb-1">
               اتصال زنده به سرور خارجی (Live Remote SSH)
             </h3>
-            <p className="text-xs text-slate-500 max-w-lg mb-5 leading-relaxed">
+            <p className="text-xs text-slate-400 max-w-lg mb-5 leading-relaxed">
               با وارد کردن آدرس IP سرور لینوکس، پورت و رمز عبور در کادر بالا، ترمینال خط‌به‌خط و بلادرنگ به سرور شما وصل می‌شود و خروجی کامل شل، bash، دستورات سیستم و ویرایشگرها را زنده استریم می‌کند.
             </p>
             <button
               onClick={() => setShowConnectBar(true)}
-              className="px-6 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold flex items-center gap-2 shadow-xs transition-all cursor-pointer"
+              className="px-6 py-2.5 bg-sky-500 hover:bg-sky-600 text-slate-950 font-bold rounded-xl text-xs flex items-center gap-2 shadow-md transition-all cursor-pointer"
             >
               <Server className="w-4 h-4" />
               <span>باز کردن فرم اتصال سریع سرور</span>
@@ -940,35 +1148,204 @@ export const TerminalView: React.FC<TerminalViewProps> = ({
         )}
       </div>
 
-      {/* Quick Interactive Command Input Bar */}
-      <form
-        onSubmit={handleQuickSubmit}
-        className="flex items-center gap-2 p-2.5 bg-white border-t border-slate-200 dir-rtl"
-      >
-        <div className="flex items-center gap-1.5 text-xs text-slate-500 font-mono px-2">
-          <TerminalIcon className="w-4 h-4 text-blue-600" />
-          <span className="hidden sm:inline font-sans text-slate-700 font-medium">ارسال خط فرمان:</span>
+      {/* Quick Interactive Command Input Bar & Predictive Suggestions */}
+      <div className="relative border-t border-slate-200 bg-white dir-rtl">
+        {/* Predictive Suggestions Floating Panel when input has focus or content */}
+        {isInputFocused && suggestedCommands.length > 0 && (
+          <div className="absolute bottom-full left-2 right-2 mb-1.5 bg-white/95 backdrop-blur-md border border-slate-200 rounded-xl shadow-xl overflow-hidden z-40 p-1.5 transition-all">
+            <div className="flex items-center justify-between px-2 py-1 text-[11px] font-semibold text-slate-400 border-b border-slate-100">
+              <div className="flex items-center gap-1.5">
+                <Sparkles className="w-3.5 h-3.5 text-blue-600" />
+                <span>پیشنهادات هوشمند دستور (تاریخچه و دستورات ذخیره‌شده)</span>
+              </div>
+              <span className="text-[10px] text-slate-400 font-normal">کلیک برای انتخاب یا اینتر</span>
+            </div>
+            <div className="max-h-48 overflow-y-auto divide-y divide-slate-50 mt-1">
+              {suggestedCommands.map((item, idx) => (
+                <button
+                  key={`${item.command}-${idx}`}
+                  type="button"
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    setQuickInput(item.command);
+                    runCommandLine(item.command);
+                    setCmdHistory((prev) => [item.command, ...prev.filter((c) => c !== item.command)].slice(0, 50));
+                    setIsInputFocused(false);
+                  }}
+                  className={`w-full text-right px-3 py-2 rounded-lg flex items-center justify-between gap-3 text-xs transition-colors cursor-pointer group ${
+                    selectedSuggestionIndex === idx ? 'bg-blue-50 text-blue-900' : 'hover:bg-slate-50 text-slate-700'
+                  }`}
+                >
+                  <div className="flex items-center gap-2 overflow-hidden flex-1">
+                    {item.isSaved ? (
+                      <Bookmark className="w-3.5 h-3.5 text-amber-500 shrink-0" />
+                    ) : (
+                      <History className="w-3.5 h-3.5 text-slate-400 group-hover:text-blue-500 shrink-0" />
+                    )}
+                    <span className="font-mono text-xs text-slate-800 dir-ltr text-left truncate flex-1 font-semibold">
+                      {item.command}
+                    </span>
+                  </div>
+                  {item.title && (
+                    <span className="text-[11px] text-slate-400 shrink-0 hidden sm:inline font-sans">
+                      {item.title}
+                    </span>
+                  )}
+                  <Play className="w-3 h-3 text-slate-300 group-hover:text-blue-600 shrink-0" />
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+
+        {/* Input Form */}
+        <form onSubmit={handleQuickSubmit} className="flex items-center gap-2 p-2.5">
+          <div className="flex items-center gap-1.5 text-xs text-slate-600 font-mono px-2 shrink-0">
+            <TerminalIcon className="w-4 h-4 text-blue-600" />
+            <span className="hidden sm:inline font-sans font-medium text-slate-700">ارسال خط فرمان:</span>
+          </div>
+
+          <div className="relative flex-1">
+            <input
+              ref={commandInputRef}
+              type="text"
+              value={quickInput}
+              onChange={(e) => {
+                setQuickInput(e.target.value);
+                setHistoryNavIndex(-1);
+              }}
+              onFocus={() => setIsInputFocused(true)}
+              onBlur={() => setTimeout(() => setIsInputFocused(false), 200)}
+              onKeyDown={handleKeyDownInCommandInput}
+              placeholder={
+                terminalMode === 'ssh'
+                  ? 'دستور را وارد کنید (جهت بالا/پایین برای تاریخچه، مثال: htop, docker ps, uname -a)...'
+                  : 'دستور لینوکس برای ترمینال وب (مثال: help, neofetch, ls -la, ping google.com)...'
+              }
+              className="w-full bg-slate-50 border border-slate-300 rounded-lg pl-8 pr-3 py-2 text-xs text-slate-800 font-mono focus:outline-none focus:border-blue-500 focus:bg-white dir-ltr placeholder:text-slate-400 placeholder:dir-rtl placeholder:text-right"
+            />
+            {quickInput.trim() && (
+              <button
+                type="button"
+                onClick={handleSaveCurrentCommand}
+                title="ذخیره این دستور در لیست منتخب"
+                className="absolute left-2 top-1/2 -translate-y-1/2 p-1 text-slate-400 hover:text-amber-500 rounded transition-colors cursor-pointer"
+              >
+                {saveSuccessNotice ? (
+                  <Check className="w-3.5 h-3.5 text-emerald-500" />
+                ) : (
+                  <BookmarkPlus className="w-3.5 h-3.5" />
+                )}
+              </button>
+            )}
+          </div>
+
+          {/* Quick Save Bookmark Action if text entered */}
+          {quickInput.trim() && (
+            <button
+              type="button"
+              onClick={handleSaveCurrentCommand}
+              className="hidden md:flex items-center gap-1 px-3 py-2 bg-amber-50 hover:bg-amber-100 text-amber-800 border border-amber-200 rounded-lg text-xs font-medium transition-colors cursor-pointer shrink-0"
+              title="ذخیره این دستور برای پیشنهادات بعدی"
+            >
+              {saveSuccessNotice ? (
+                <>
+                  <Check className="w-3.5 h-3.5 text-emerald-600" />
+                  <span className="text-emerald-700">ذخیره شد</span>
+                </>
+              ) : (
+                <>
+                  <BookmarkPlus className="w-3.5 h-3.5 text-amber-600" />
+                  <span>ذخیره دستور</span>
+                </>
+              )}
+            </button>
+          )}
+
+          <button
+            type="submit"
+            disabled={!quickInput.trim()}
+            className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors shadow-xs cursor-pointer shrink-0"
+          >
+            <Send className="w-3.5 h-3.5" />
+            <span>ارسال</span>
+          </button>
+        </form>
+      </div>
+
+      {/* Saved Commands Modal */}
+      {showSavedModal && (
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4 z-50 dir-rtl">
+          <div className="bg-white rounded-2xl border border-slate-200 shadow-2xl max-w-lg w-full overflow-hidden animate-in fade-in zoom-in duration-150">
+            <div className="flex items-center justify-between p-4 border-b border-slate-200 bg-slate-50">
+              <div className="flex items-center gap-2">
+                <Bookmark className="w-4 h-4 text-amber-600" />
+                <h3 className="text-sm font-bold text-slate-800">بانک دستورات ذخیره‌شده و پرکاربرد</h3>
+              </div>
+              <button
+                onClick={() => setShowSavedModal(false)}
+                className="p-1 rounded-lg hover:bg-slate-200 text-slate-500 transition-colors cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+
+            <div className="p-4 max-h-96 overflow-y-auto space-y-2">
+              {savedCommands.length === 0 ? (
+                <div className="text-center py-8 text-slate-400 text-xs">
+                  هیچ دستوری ذخیره نشده است. با تایپ دستور و زدن آیکون بوکمارک می‌توانید دستورات را ذخیره کنید.
+                </div>
+              ) : (
+                savedCommands.map((sc) => (
+                  <div
+                    key={sc.id}
+                    className="p-2.5 rounded-xl border border-slate-200 hover:border-blue-300 bg-slate-50/50 hover:bg-white flex items-center justify-between gap-3 transition-all group"
+                  >
+                    <div className="flex-1 overflow-hidden">
+                      <div className="text-xs font-bold text-slate-800 mb-0.5">{sc.title || 'دستور اختصاصی'}</div>
+                      <div className="font-mono text-xs text-blue-600 dir-ltr text-left truncate">
+                        {sc.command}
+                      </div>
+                    </div>
+                    <div className="flex items-center gap-1.5 shrink-0">
+                      <button
+                        onClick={() => {
+                          runCommandLine(sc.command);
+                          setShowSavedModal(false);
+                        }}
+                        className="px-2.5 py-1.5 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-semibold flex items-center gap-1 transition-colors cursor-pointer"
+                        title="اجرای مستقیم در سرور"
+                      >
+                        <Play className="w-3 h-3" />
+                        <span>اجرا</span>
+                      </button>
+                      <button
+                        onClick={() => {
+                          setSavedCommands((prev) => prev.filter((item) => item.id !== sc.id));
+                        }}
+                        className="p-1.5 text-slate-400 hover:text-rose-600 rounded-lg hover:bg-rose-50 transition-colors cursor-pointer"
+                        title="حذف از ذخیره‌ها"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                ))
+              )}
+            </div>
+
+            <div className="p-3 bg-slate-50 border-t border-slate-200 flex justify-between items-center text-xs text-slate-500">
+              <span>تعداد دستورات: {savedCommands.length}</span>
+              <button
+                onClick={() => setShowSavedModal(false)}
+                className="px-4 py-1.5 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-lg font-medium cursor-pointer transition-colors"
+              >
+                بستن
+              </button>
+            </div>
+          </div>
         </div>
-        <input
-          type="text"
-          value={quickInput}
-          onChange={(e) => setQuickInput(e.target.value)}
-          placeholder={
-            terminalMode === 'ssh'
-              ? 'دستور زنده برای سرور خارجی را وارد کنید (مثال: htop, docker ps, uname -a, apt update)...'
-              : 'دستور لینوکس برای ترمینال وب (مثال: help, neofetch, ls -la, ping google.com)...'
-          }
-          className="flex-1 bg-slate-50 border border-slate-300 rounded-lg px-3 py-2 text-xs text-slate-800 font-mono focus:outline-none focus:border-blue-500 focus:bg-white dir-ltr placeholder:text-slate-400"
-        />
-        <button
-          type="submit"
-          disabled={!quickInput.trim()}
-          className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors shadow-xs cursor-pointer"
-        >
-          <Send className="w-3.5 h-3.5" />
-          <span>ارسال</span>
-        </button>
-      </form>
+      )}
     </div>
   );
 };

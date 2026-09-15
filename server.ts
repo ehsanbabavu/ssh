@@ -11,6 +11,7 @@ import {
   listSFTPDirectory,
   readSFTPFile,
   writeSFTPFile,
+  deleteSFTPItem,
 } from './src/server/ssh-service.js';
 import { handleSSHWebSocketConnection } from './src/server/ws-ssh-handler.js';
 
@@ -85,6 +86,19 @@ async function startServer() {
     try {
       const { config, path: filePath, content } = req.body;
       await writeSFTPFile(config, filePath, content);
+      res.json({ success: true });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  });
+
+  app.post('/api/ssh/sftp/delete', async (req, res) => {
+    try {
+      const { config, path: itemPath, isDirectory } = req.body;
+      if (!config || !itemPath) {
+        return res.status(400).json({ success: false, error: 'Path and config are required' });
+      }
+      await deleteSFTPItem(config, itemPath, Boolean(isDirectory));
       res.json({ success: true });
     } catch (err: any) {
       res.status(500).json({ success: false, error: err.message });

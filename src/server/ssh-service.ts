@@ -356,3 +356,67 @@ export function writeSFTPFile(config: SSHConfig, filePath: string, content: stri
     }
   });
 }
+
+export function deleteSFTPItem(config: SSHConfig, itemPath: string, isDirectory: boolean): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const conn = new SSHClient();
+
+    conn.on('ready', () => {
+      conn.sftp((err, sftp) => {
+        if (err) {
+          conn.end();
+          return reject(err);
+        }
+
+        if (isDirectory) {
+          // First attempt rmdir, or recursive removal if needed
+          sftp.rmdir(itemPath, (rmErr) => {
+            if (rmErr) {
+              // If rmdir fails because folder is not empty, fallback to rm -rf via exec shell
+              conn.exec(`rm -rf "${itemPath.replace(/"/g, '\\"')}"`, (execErr, stream) => {
+                if (execErr) {
+                  conn.end();
+                  return reject(execErr);
+                }
+                stream.on('close', (code: number) => {
+                  conn.end();
+                  if (code === 0) resolve();
+                  else reject(new Error(`خطا در حذف پوشه (کد خروجی: ${code})`));
+                });
+              });
+            } else {
+              conn.end();
+              resolve();
+            }
+          });
+        } else {
+          sftp.unlink(itemPath, (unlinkErr) => {
+            conn.end();
+            if (unlinkErr) return reject(unlinkErr);
+            resolve();
+          });
+        }
+      });
+    });
+
+    conn.on('error', (err) => {
+      conn.end();
+      reject(err);
+    });
+
+    try {
+      conn.connect({
+        host: config.host,
+        port: Number(config.port) || 22,
+        username: config.username,
+        password: config.authType === 'password' ? config.password : undefined,
+        privateKey: config.authType === 'privateKey' ? config.privateKey : undefined,
+        passphrase: config.passphrase,
+        readyTimeout: 10000,
+      });
+    } catch (e: any) {
+      reject(e);
+    }
+  });
+}
+

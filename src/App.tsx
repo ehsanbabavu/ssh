@@ -248,16 +248,17 @@ export function App() {
 
       {/* Main Content Area */}
       <main className="flex-1 max-w-7xl w-full mx-auto p-4 md:p-8 space-y-6">
-        {/* Live Terminal */}
-        {activeView === 'terminal' && (
+        {/* Live Terminal - Kept alive in DOM with display toggle so connection stays active across all tabs */}
+        <div className={activeView === 'terminal' ? 'block' : 'hidden'}>
           <TerminalView
             config={activeConfig}
             savedConfigs={savedConfigs}
+            isVisible={activeView === 'terminal'}
             onDisconnect={disconnectCurrentServer}
             onConnectRemote={(cfg) => setActiveConfig(cfg)}
             onSaveConfig={handleSaveConfig}
           />
-        )}
+        </div>
 
         {/* Command Runner */}
         {activeView === 'commands' &&

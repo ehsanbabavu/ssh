@@ -85,7 +85,9 @@ export function handleSSHWebSocketConnection(ws: WebSocket) {
             password: config.authType === 'password' ? config.password : undefined,
             privateKey: config.authType === 'privateKey' ? config.privateKey : undefined,
             passphrase: config.passphrase,
-            readyTimeout: 12000,
+            readyTimeout: 20000,
+            keepaliveInterval: 5000,
+            keepaliveCountMax: 10,
           });
         } catch (e: any) {
           sendMessage({ type: 'error', message: `خطا در پارامترهای اتصال: ${e.message}` });

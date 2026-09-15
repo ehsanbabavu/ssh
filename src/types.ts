@@ -78,3 +78,12 @@ export interface QuickMacro {
   description: string;
   category: 'system' | 'network' | 'docker' | 'files' | 'process';
 }
+
+export interface SavedCommand {
+  id: string;
+  command: string;
+  title?: string;
+  createdAt: number;
+  lastUsedAt?: number;
+  useCount: number;
+}

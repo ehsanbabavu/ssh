@@ -15,6 +15,7 @@ import {
   AlertTriangle,
   Eye,
   Check,
+  Trash2,
 } from 'lucide-react';
 import type { SSHConfig, SFTPItem } from '../types';
 
@@ -23,7 +24,13 @@ interface SFTPExplorerProps {
 }
 
 export const SFTPExplorer: React.FC<SFTPExplorerProps> = ({ config }) => {
-  const [currentPath, setCurrentPath] = useState<string>('.');
+  const storageKey = `sftp_path_${config.id || config.host}`;
+  const [currentPath, setCurrentPath] = useState<string>(() => {
+    return localStorage.getItem(storageKey) || '.';
+  });
+  const [inputPath, setInputPath] = useState<string>(() => {
+    return localStorage.getItem(storageKey) || '.';
+  });
   const [items, setItems] = useState<SFTPItem[]>([]);
   const [loading, setLoading] = useState<boolean>(true);
   const [error, setError] = useState<string | null>(null);
@@ -34,6 +41,11 @@ export const SFTPExplorer: React.FC<SFTPExplorerProps> = ({ config }) => {
   const [loadingFile, setLoadingFile] = useState<boolean>(false);
   const [savingFile, setSavingFile] = useState<boolean>(false);
   const [saveSuccess, setSaveSuccess] = useState<boolean>(false);
+
+  // Delete state
+  const [itemToDelete, setItemToDelete] = useState<SFTPItem | null>(null);
+  const [deleting, setDeleting] = useState<boolean>(false);
+  const [deleteStatusMessage, setDeleteStatusMessage] = useState<string | null>(null);
 
   const loadDirectory = async (path: string) => {
     setLoading(true);
@@ -48,6 +60,8 @@ export const SFTPExplorer: React.FC<SFTPExplorerProps> = ({ config }) => {
       if (data.success && data.items) {
         setItems(data.items);
         setCurrentPath(path);
+        setInputPath(path);
+        localStorage.setItem(storageKey, path);
       } else {
         setError(data.error || 'خطا در دریافت لیست فایل‌های SFTP');
       }
@@ -59,8 +73,11 @@ export const SFTPExplorer: React.FC<SFTPExplorerProps> = ({ config }) => {
   };
 
   useEffect(() => {
-    loadDirectory('.');
-  }, [config]);
+    const savedPath = localStorage.getItem(storageKey) || '.';
+    setCurrentPath(savedPath);
+    setInputPath(savedPath);
+    loadDirectory(savedPath);
+  }, [config.id, config.host]);
 
   const openItem = (item: SFTPItem) => {
     if (item.isDirectory) {
@@ -124,6 +141,36 @@ export const SFTPExplorer: React.FC<SFTPExplorerProps> = ({ config }) => {
     }
   };
 
+  const handleDeleteItem = async () => {
+    if (!itemToDelete) return;
+    setDeleting(true);
+
+    try {
+      const res = await fetch('/api/ssh/sftp/delete', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          config,
+          path: itemToDelete.path,
+          isDirectory: itemToDelete.isDirectory,
+        }),
+      });
+      const data = await res.json();
+      if (data.success) {
+        setDeleteStatusMessage(`«${itemToDelete.name}» با موفقیت حذف شد.`);
+        setItemToDelete(null);
+        setTimeout(() => setDeleteStatusMessage(null), 3500);
+        loadDirectory(currentPath);
+      } else {
+        alert(`خطا در حذف: ${data.error || 'دسترسی مجاز نیست'}`);
+      }
+    } catch (err: any) {
+      alert(`خطا در ارتباط با سرور: ${err.message}`);
+    } finally {
+      setDeleting(false);
+    }
+  };
+
   const navigateUp = () => {
     if (currentPath === '.' || currentPath === '/') return;
     const parts = currentPath.split('/').filter(Boolean);
@@ -166,11 +213,27 @@ export const SFTPExplorer: React.FC<SFTPExplorerProps> = ({ config }) => {
         </button>
       </div>
 
-      {/* Path Breadcrumb Navigation */}
+      {/* Success alert message for actions */}
+      {deleteStatusMessage && (
+        <div className="p-3 bg-emerald-50 border border-emerald-200 rounded-xl text-emerald-800 text-xs flex items-center justify-between">
+          <div className="flex items-center gap-2 font-medium">
+            <Check className="w-4 h-4 text-emerald-600" />
+            <span>{deleteStatusMessage}</span>
+          </div>
+          <button
+            onClick={() => setDeleteStatusMessage(null)}
+            className="text-emerald-700 hover:text-emerald-900 cursor-pointer"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      )}
+
+      {/* Path Breadcrumb & Editable Navigation */}
       <div className="flex items-center gap-2 bg-slate-50/80 p-2.5 rounded-xl border border-slate-200 text-xs dir-ltr">
         <button
           onClick={() => loadDirectory('/')}
-          className="p-1.5 rounded-lg hover:bg-slate-200/60 text-slate-500 hover:text-slate-800 transition-colors cursor-pointer"
+          className="p-1.5 rounded-lg hover:bg-slate-200/60 text-slate-500 hover:text-slate-800 transition-colors cursor-pointer shrink-0"
           title="پوشه ریشه /"
         >
           <Home className="w-4 h-4" />
@@ -178,15 +241,37 @@ export const SFTPExplorer: React.FC<SFTPExplorerProps> = ({ config }) => {
         <button
           onClick={navigateUp}
           disabled={currentPath === '.' || currentPath === '/'}
-          className="p-1.5 rounded-lg hover:bg-slate-200/60 text-slate-500 hover:text-slate-800 disabled:opacity-30 transition-colors cursor-pointer"
+          className="p-1.5 rounded-lg hover:bg-slate-200/60 text-slate-500 hover:text-slate-800 disabled:opacity-30 transition-colors cursor-pointer shrink-0"
           title="سطح قبلی (Parent Directory)"
         >
           <ArrowLeft className="w-4 h-4" />
         </button>
 
-        <span className="text-slate-300">|</span>
-        <span className="text-slate-400 font-mono">/</span>
-        <span className="font-mono font-semibold text-emerald-700 truncate">{currentPath}</span>
+        <span className="text-slate-300 shrink-0">|</span>
+
+        <form
+          onSubmit={(e) => {
+            e.preventDefault();
+            if (inputPath.trim()) {
+              loadDirectory(inputPath.trim());
+            }
+          }}
+          className="flex-1 flex items-center gap-1.5"
+        >
+          <input
+            type="text"
+            value={inputPath}
+            onChange={(e) => setInputPath(e.target.value)}
+            placeholder="/var/www یا /home/..."
+            className="w-full bg-white border border-slate-300 focus:border-emerald-500 rounded-lg px-2.5 py-1 text-xs font-mono text-slate-800 focus:outline-none"
+          />
+          <button
+            type="submit"
+            className="px-2.5 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded-lg text-xs font-medium cursor-pointer shrink-0"
+          >
+            برو
+          </button>
+        </form>
       </div>
 
       {/* File List Table */}
@@ -211,7 +296,7 @@ export const SFTPExplorer: React.FC<SFTPExplorerProps> = ({ config }) => {
                 <th className="py-3 px-4">نام فایل / پوشه</th>
                 <th className="py-3 px-4">حجم</th>
                 <th className="py-3 px-4">آخرین تغییر</th>
-                <th className="py-3 px-4 text-center">عملیات</th>
+                <th className="py-3 px-4 text-center w-36">عملیات</th>
               </tr>
             </thead>
             <tbody className="divide-y divide-slate-100">
@@ -242,25 +327,72 @@ export const SFTPExplorer: React.FC<SFTPExplorerProps> = ({ config }) => {
                     <td className="py-2.5 px-4 font-mono text-slate-500 text-[11px]">
                       {item.modifyTime ? new Date(item.modifyTime * 1000).toLocaleDateString('fa-IR') : '-'}
                     </td>
-                    <td className="py-2.5 px-4 text-center">
-                      {!item.isDirectory && (
+                    <td className="py-2.5 px-4 text-center" onClick={(e) => e.stopPropagation()}>
+                      <div className="flex items-center justify-center gap-1.5">
+                        {!item.isDirectory && (
+                          <button
+                            onClick={() => openFileEditor(item)}
+                            className="p-1.5 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-[11px] font-medium inline-flex items-center gap-1 transition-colors cursor-pointer"
+                            title="مشاهده و ویرایش فایل"
+                          >
+                            <Eye className="w-3.5 h-3.5 text-emerald-600" />
+                          </button>
+                        )}
                         <button
-                          onClick={(e) => {
-                            e.stopPropagation();
-                            openFileEditor(item);
-                          }}
-                          className="px-2.5 py-1 bg-slate-100 hover:bg-slate-200 text-slate-700 rounded-lg text-[11px] font-medium inline-flex items-center gap-1 transition-colors cursor-pointer"
+                          onClick={() => setItemToDelete(item)}
+                          className="p-1.5 bg-slate-100 hover:bg-rose-50 text-slate-500 hover:text-rose-600 rounded-lg text-[11px] font-medium inline-flex items-center transition-colors cursor-pointer"
+                          title={`حذف ${item.isDirectory ? 'پوشه' : 'فایل'}`}
                         >
-                          <Eye className="w-3 h-3 text-emerald-600" />
-                          <span>مشاهده/ویرایش</span>
+                          <Trash2 className="w-3.5 h-3.5" />
                         </button>
-                      )}
+                      </div>
                     </td>
                   </tr>
                 ))
               )}
             </tbody>
           </table>
+        </div>
+      )}
+
+      {/* Delete Confirmation Modal */}
+      {itemToDelete && (
+        <div className="fixed inset-0 bg-slate-900/50 backdrop-blur-xs flex items-center justify-center p-4 z-50 dir-rtl">
+          <div className="bg-white border border-slate-200 rounded-2xl w-full max-w-md shadow-2xl p-6 space-y-4">
+            <div className="w-12 h-12 bg-rose-100 text-rose-600 rounded-2xl flex items-center justify-center mx-auto">
+              <Trash2 className="w-6 h-6" />
+            </div>
+
+            <div className="text-center space-y-2">
+              <h4 className="text-base font-bold text-slate-900">
+                حذف {itemToDelete.isDirectory ? 'پوشه' : 'فایل'} از سرور
+              </h4>
+              <p className="text-xs text-slate-600">
+                آیا از حذف دائم مورد زیر مطمئن هستید؟ این عملیات غیرقابل بازگشت است.
+              </p>
+              <div className="p-3 bg-slate-50 rounded-xl border border-slate-200 text-xs font-mono text-slate-800 dir-ltr text-center truncate">
+                {itemToDelete.path}
+              </div>
+            </div>
+
+            <div className="flex items-center justify-end gap-2.5 pt-2">
+              <button
+                onClick={() => setItemToDelete(null)}
+                disabled={deleting}
+                className="px-4 py-2 bg-slate-100 hover:bg-slate-200 text-slate-700 text-xs font-semibold rounded-xl transition-colors cursor-pointer"
+              >
+                انصراف
+              </button>
+              <button
+                onClick={handleDeleteItem}
+                disabled={deleting}
+                className="px-4 py-2 bg-rose-600 hover:bg-rose-700 text-white text-xs font-semibold rounded-xl flex items-center gap-1.5 transition-colors cursor-pointer shadow-xs"
+              >
+                {deleting && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                <span>{deleting ? 'در حال حذف...' : 'بله، حذف کن'}</span>
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
