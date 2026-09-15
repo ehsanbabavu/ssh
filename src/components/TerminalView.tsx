@@ -6,55 +6,123 @@ import {
   Maximize2,
   Minimize2,
   Trash2,
-  Copy,
   RefreshCw,
   Zap,
   Terminal as TerminalIcon,
-  Sun,
-  Moon,
-  ChevronRight,
-  Send,
+  Server,
+  Laptop,
   AlertTriangle,
-  CheckCircle2,
+  Send,
   Play,
+  ArrowRight,
+  HelpCircle,
+  Code2,
+  Globe,
+  User,
+  Lock,
+  Key,
+  CheckCircle2,
+  Loader2,
+  ChevronDown,
+  ChevronUp,
+  Power,
+  ShieldCheck,
+  Radio,
+  Eye,
+  EyeOff,
 } from 'lucide-react';
 import { TERMINAL_THEMES, DEFAULT_QUICK_MACROS } from '../data/constants';
-import type { SSHConfig, QuickMacro } from '../types';
+import { VirtualBashShell } from '../utils/virtualShell';
+import type { SSHConfig, SSHTestResult } from '../types';
 
 interface TerminalViewProps {
-  config: SSHConfig;
+  config?: SSHConfig | null;
+  savedConfigs?: SSHConfig[];
   onDisconnect?: () => void;
-  onRunMacro?: (command: string) => void;
+  onConnectRemote?: (config: SSHConfig) => void;
+  onSaveConfig?: (config: SSHConfig) => void;
 }
 
-export const TerminalView: React.FC<TerminalViewProps> = ({ config, onDisconnect }) => {
+export const TerminalView: React.FC<TerminalViewProps> = ({
+  config,
+  savedConfigs = [],
+  onDisconnect,
+  onConnectRemote,
+  onSaveConfig,
+}) => {
   const containerRef = useRef<HTMLDivElement>(null);
   const terminalRef = useRef<Terminal | null>(null);
   const fitAddonRef = useRef<FitAddon | null>(null);
   const wsRef = useRef<WebSocket | null>(null);
+  const shellRef = useRef<VirtualBashShell>(new VirtualBashShell());
 
-  const [status, setStatus] = useState<'connecting' | 'connected' | 'closed' | 'error'>('connecting');
-  const [statusMessage, setStatusMessage] = useState<string>('در حال برقراری اتصال...');
-  const [themeId, setThemeId] = useState<string>('dracula');
+  // Mode: 'ssh' for real remote VPS/server, 'web-local' for in-browser POSIX shell
+  const [terminalMode, setTerminalMode] = useState<'ssh' | 'web-local'>('ssh');
+
+  // Active remote SSH configuration
+  const [currentSSHConfig, setCurrentSSHConfig] = useState<SSHConfig | null>(config || null);
+
+  // Quick Connect form states
+  const [showConnectBar, setShowConnectBar] = useState<boolean>(!config);
+  const [host, setHost] = useState<string>(config?.host || '');
+  const [port, setPort] = useState<number>(config?.port || 22);
+  const [username, setUsername] = useState<string>(config?.username || 'root');
+  const [authType, setAuthType] = useState<'password' | 'privateKey'>(config?.authType || 'password');
+  const [password, setPassword] = useState<string>(config?.password || '');
+  const [privateKey, setPrivateKey] = useState<string>(config?.privateKey || '');
+  const [showPassword, setShowPassword] = useState<boolean>(false);
+  const [saveToHistory, setSaveToHistory] = useState<boolean>(true);
+
+  // Status & Connection States
+  const [status, setStatus] = useState<'connected' | 'connecting' | 'closed' | 'error'>('closed');
+  const [statusMessage, setStatusMessage] = useState<string>('ترمینال خارجی آماده اتصال است');
+  const [latency, setLatency] = useState<number | null>(null);
+  const [testTesting, setTestTesting] = useState<boolean>(false);
+  const [testResult, setTestResult] = useState<SSHTestResult | null>(null);
+
+  // Display Controls
+  const [themeId, setThemeId] = useState<string>('github-light');
   const [fontSize, setFontSize] = useState<number>(14);
   const [isFullscreen, setIsFullscreen] = useState<boolean>(false);
   const [quickInput, setQuickInput] = useState<string>('');
   const [showMacrosMenu, setShowMacrosMenu] = useState<boolean>(false);
+  const [reconnectCounter, setReconnectCounter] = useState<number>(0);
 
-  // Initialize Terminal & WebSocket Connection
+  // Local shell state references
+  const currentLineRef = useRef<string>('');
+  const historyIndexRef = useRef<number>(-1);
+
+  // Sync prop changes
+  useEffect(() => {
+    if (config) {
+      setCurrentSSHConfig(config);
+      setHost(config.host);
+      setPort(config.port || 22);
+      setUsername(config.username);
+      setAuthType(config.authType || 'password');
+      setPassword(config.password || '');
+      setPrivateKey(config.privateKey || '');
+      setTerminalMode('ssh');
+      setShowConnectBar(false);
+    }
+  }, [config]);
+
+  // Initialize Terminal Instance & Handle I/O
   useEffect(() => {
     if (!containerRef.current) return;
 
-    const themeObj = TERMINAL_THEMES.find((t) => t.id === themeId)?.theme || TERMINAL_THEMES[0].theme;
+    const themeObj =
+      TERMINAL_THEMES.find((t) => t.id === themeId)?.theme || TERMINAL_THEMES[0].theme;
 
     const term = new Terminal({
       fontSize,
-      fontFamily: 'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
+      fontFamily:
+        'ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace',
       cursorBlink: true,
       cursorStyle: 'block',
       theme: themeObj,
       allowProposedApi: true,
-      scrollback: 5000,
+      scrollback: 8000,
       convertEol: true,
     });
 
@@ -65,89 +133,260 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ config, onDisconnect
     term.loadAddon(webLinksAddon);
 
     term.open(containerRef.current);
-    fitAddon.fit();
+    try {
+      fitAddon.fit();
+    } catch (e) {}
 
     terminalRef.current = term;
     fitAddonRef.current = fitAddon;
 
-    term.writeln(`\x1b[36m⚡ در حال اتصال به سرور SSH: ${config.username}@${config.host}:${config.port || 22}...\x1b[0m\r\n`);
+    let ws: WebSocket | null = null;
+    let onDataDisposable: { dispose: () => void } | null = null;
+    let onResizeDisposable: { dispose: () => void } | null = null;
 
-    // Connect WebSocket
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws/ssh`;
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
+    if (terminalMode === 'ssh') {
+      if (currentSSHConfig && currentSSHConfig.host && currentSSHConfig.username) {
+        // Active Real Remote SSH Connection via WebSocket
+        setStatus('connecting');
+        setStatusMessage(`در حال اتصال لایو به سرور خارجی: ${currentSSHConfig.username}@${currentSSHConfig.host}:${currentSSHConfig.port || 22}...`);
 
-    ws.onopen = () => {
-      ws.send(
-        JSON.stringify({
-          type: 'init',
-          config,
-          cols: term.cols,
-          rows: term.rows,
-        })
-      );
-    };
+        term.writeln(
+          `\x1b[1;36m┌─────────────────────────────────────────────────────────────────────────┐\x1b[0m`
+        );
+        term.writeln(
+          `\x1b[1;36m│\x1b[0m \x1b[1;37m⚡ برقراری اتصال زنده SSH به سرور خارجی (Live Remote SSH Terminal)\x1b[0m       \x1b[1;36m│\x1b[0m`
+        );
+        term.writeln(
+          `\x1b[1;36m│\x1b[0m سرور: \x1b[32m${currentSSHConfig.username}@${currentSSHConfig.host}:${currentSSHConfig.port || 22}\x1b[0m                                     \x1b[1;36m│\x1b[0m`
+        );
+        term.writeln(
+          `\x1b[1;36m└─────────────────────────────────────────────────────────────────────────┘\x1b[0m\r\n`
+        );
 
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
+        const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+        const wsUrl = `${protocol}//${window.location.host}/ws/ssh`;
+        ws = new WebSocket(wsUrl);
+        wsRef.current = ws;
 
-        if (msg.type === 'output') {
-          term.write(msg.data);
-        } else if (msg.type === 'status') {
-          if (msg.status === 'connected') {
-            setStatus('connected');
-            setStatusMessage('ارتباط برقرار شد');
-            term.writeln(`\x1b[32m✔ ${msg.message}\x1b[0m\r\n`);
-          } else if (msg.status === 'closed') {
-            setStatus('closed');
-            setStatusMessage(msg.message || 'جلسه متوقف شد');
-            term.writeln(`\r\n\x1b[33m⚡ ${msg.message}\x1b[0m\r\n`);
-          } else if (msg.status === 'connecting') {
-            setStatus('connecting');
-            setStatusMessage(msg.message);
+        const connectStartTime = Date.now();
+
+        ws.onopen = () => {
+          ws?.send(
+            JSON.stringify({
+              type: 'init',
+              config: currentSSHConfig,
+              cols: term.cols,
+              rows: term.rows,
+            })
+          );
+        };
+
+        ws.onmessage = (event) => {
+          try {
+            const msg = JSON.parse(event.data);
+            if (msg.type === 'output') {
+              term.write(msg.data);
+            } else if (msg.type === 'status') {
+              if (msg.status === 'connected') {
+                setStatus('connected');
+                const elapsed = Date.now() - connectStartTime;
+                setLatency(elapsed);
+                setStatusMessage(`اتصال لایو SSH برقرار شد (${elapsed}ms)`);
+                term.writeln(`\r\n\x1b[1;32m✔ ${msg.message} (تاخیر: ${elapsed} میلی‌ثانیه)\x1b[0m\r\n`);
+                term.focus();
+              } else if (msg.status === 'closed') {
+                setStatus('closed');
+                setStatusMessage(msg.message || 'ارتباط با سرور خارجی بسته شد');
+                term.writeln(`\r\n\x1b[33m⚡ ${msg.message}\x1b[0m\r\n`);
+              } else if (msg.status === 'connecting') {
+                setStatus('connecting');
+                setStatusMessage(msg.message);
+              }
+            } else if (msg.type === 'banner') {
+              term.write(`\r\n\x1b[35m[SSH Banner] ${msg.banner}\x1b[0m\r\n`);
+            } else if (msg.type === 'error') {
+              setStatus('error');
+              setStatusMessage(msg.message);
+              term.writeln(`\r\n\x1b[1;31m❌ خطای اتصال به سرور خارجی:\x1b[0m \x1b[31m${msg.message}\x1b[0m\r\n`);
+              term.writeln(`\x1b[90mراهنما: پورت ۲۲ سرور، آدرس IP و رمز عبور وارد شده را بررسی فرمایید.\x1b[0m\r\n`);
+            }
+          } catch (err) {
+            console.error('Error handling WS message:', err);
           }
-        } else if (msg.type === 'banner') {
-          term.write(`\r\n\x1b[35m[SSH Banner] ${msg.banner}\x1b[0m\r\n`);
-        } else if (msg.type === 'error') {
+        };
+
+        ws.onerror = () => {
           setStatus('error');
-          setStatusMessage(msg.message);
-          term.writeln(`\r\n\x1b[31m❌ خطای اتصال: ${msg.message}\x1b[0m\r\n`);
-        }
-      } catch (err) {
-        console.error('Error handling WS message:', err);
-      }
-    };
+          setStatusMessage('خطا در برقراری ارتباط با سرور یا مسدود بودن پورت SSH');
+          term.writeln(
+            '\r\n\x1b[1;31m❌ خطا در برقراری ارتباط شبکه با سرور خارجی.\x1b[0m\r\n' +
+              '\x1b[33mنکات مهم جهت بررسی:\x1b[0m\r\n' +
+              '  ۱. پورت ۲۲ سرور لینوکس در فایروال (UFW / Security Group) باز باشد.\r\n' +
+              '  ۲. آدرس IP یا دامنه وارد شده صحیح و آنلاین باشد.\r\n' +
+              '  ۳. در صورت نیاز به اجرای درون مرورگر، از گزینه «ترمینال لایو وب» استفاده کنید.\r\n'
+          );
+        };
 
-    ws.onerror = (err) => {
-      setStatus('error');
-      setStatusMessage('خطای ارتباط با سرور برنامه (WebSocket Error)');
-      term.writeln('\r\n\x1b[31m❌ خطای ارتباط با WebSocket backend.\x1b[0m\r\n');
-    };
+        ws.onclose = () => {
+          if (status !== 'error') {
+            setStatus('closed');
+            setStatusMessage('ارتباط لایو با سرور خارجی پایان یافت');
+          }
+        };
 
-    ws.onclose = () => {
-      if (status !== 'error') {
+        onDataDisposable = term.onData((data) => {
+          if (ws?.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'input', data }));
+          }
+        });
+
+        onResizeDisposable = term.onResize(({ cols, rows }) => {
+          if (ws?.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({ type: 'resize', cols, rows }));
+          }
+        });
+      } else {
+        // SSH Mode selected, but no server configuration provided yet
         setStatus('closed');
-        setStatusMessage('ارتباط قطع شد');
+        setStatusMessage('لطفاً مشخصات سرور خارجی را جهت اتصال زنده وارد نمایید');
+        term.writeln(
+          `\x1b[1;33m⚡ ترمینال زنده سرور خارجی (Live Remote SSH Terminal)\x1b[0m\r\n` +
+            `\x1b[37mبرای شروع اتصال لایو به سرور لینوکس، سرور مجازی (VPS) یا رزبری‌پای:\x1b[0m\r\n` +
+            `\x1b[36m۱. آدرس IP یا دامنه سرور (Host)، پورت (22) و نام کاربری (مانند root) را در کادر بالا وارد کنید.\x1b[0m\r\n` +
+            `\x1b[36m۲. دکمه «⚡ اتصال لایو به سرور خارجی» را بزنید.\x1b[0m\r\n` +
+            `\x1b[90mهمچنین می‌توانید از منوی بالا سرورهای ذخیره‌شده را انتخاب فرمایید.\x1b[0m\r\n`
+        );
       }
-    };
+    } else {
+      // Local In-Browser Live POSIX Bash Terminal
+      setStatus('connected');
+      setStatusMessage('ترمینال لایو مرورگر فعال است');
 
-    // Forward user terminal input to WebSocket
-    const onDataDisposable = term.onData((data) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'input', data }));
-      }
-    });
+      const shell = shellRef.current;
+      currentLineRef.current = '';
+      historyIndexRef.current = -1;
 
-    // Forward terminal resize to WebSocket
-    const onResizeDisposable = term.onResize(({ cols, rows }) => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.send(JSON.stringify({ type: 'resize', cols, rows }));
-      }
-    });
+      term.writeln(
+        `\x1b[1;32m┌─────────────────────────────────────────────────────────────┐\x1b[0m`
+      );
+      term.writeln(
+        `\x1b[1;32m│\x1b[0m \x1b[1;37m🚀 ترمینال زنده شبیه‌ساز وب (Interactive Web Terminal)\x1b[0m       \x1b[1;32m│\x1b[0m`
+      );
+      term.writeln(
+        `\x1b[1;32m│\x1b[0m \x1b[36mدستورات لینوکس مستقیماً در خود سایت خط‌به‌خط اجرا می‌شوند.\x1b[0m   \x1b[1;32m│\x1b[0m`
+      );
+      term.writeln(
+        `\x1b[1;32m│\x1b[0m \x1b[33mدستور \x1b[1;32mhelp\x1b[0m\x1b[33m را تایپ کنید تا فهرست دستورات را ببینید.         \x1b[0m \x1b[1;32m│\x1b[0m`
+      );
+      term.writeln(
+        `\x1b[1;32m└─────────────────────────────────────────────────────────────┘\x1b[0m\r\n`
+      );
 
-    // Handle container resize
+      term.write(shell.getPrompt());
+
+      onDataDisposable = term.onData(async (data) => {
+        const shell = shellRef.current;
+        const currentLine = currentLineRef.current;
+        const history = shell.getHistory();
+
+        if (data === '\r' || data === '\n') {
+          term.writeln('');
+          const trimmed = currentLine.trim();
+          if (trimmed) {
+            const output = await shell.execute(trimmed);
+            if (output) term.write(output);
+          }
+          currentLineRef.current = '';
+          historyIndexRef.current = -1;
+          term.write(shell.getPrompt());
+          return;
+        }
+
+        if (data === '\x7f' || data === '\b') {
+          if (currentLineRef.current.length > 0) {
+            currentLineRef.current = currentLineRef.current.slice(0, -1);
+            term.write('\b \b');
+          }
+          return;
+        }
+
+        if (data === '\t') {
+          const suggestions = shell.getCompletions(currentLineRef.current);
+          if (suggestions.length === 1) {
+            const suggestion = suggestions[0];
+            const tokens = currentLineRef.current.split(' ');
+            tokens[tokens.length - 1] = suggestion;
+            const newLine = tokens.join(' ');
+            const diff = newLine.slice(currentLineRef.current.length);
+            currentLineRef.current = newLine;
+            term.write(diff);
+          } else if (suggestions.length > 1) {
+            term.writeln('');
+            term.writeln(suggestions.map((s) => `\x1b[36m${s}\x1b[0m`).join('    '));
+            term.write(shell.getPrompt() + currentLineRef.current);
+          }
+          return;
+        }
+
+        if (data === '\x03') {
+          term.writeln('^C');
+          currentLineRef.current = '';
+          historyIndexRef.current = -1;
+          term.write(shell.getPrompt());
+          return;
+        }
+
+        if (data === '\x0c') {
+          term.clear();
+          term.write(shell.getPrompt() + currentLineRef.current);
+          return;
+        }
+
+        if (data === '\x1b[A') {
+          if (history.length === 0) return;
+          if (historyIndexRef.current === -1) {
+            historyIndexRef.current = history.length - 1;
+          } else if (historyIndexRef.current > 0) {
+            historyIndexRef.current--;
+          }
+          const prevCmd = history[historyIndexRef.current] || '';
+          while (currentLineRef.current.length > 0) {
+            term.write('\b \b');
+            currentLineRef.current = currentLineRef.current.slice(0, -1);
+          }
+          currentLineRef.current = prevCmd;
+          term.write(prevCmd);
+          return;
+        }
+
+        if (data === '\x1b[B') {
+          if (historyIndexRef.current === -1) return;
+          if (historyIndexRef.current < history.length - 1) {
+            historyIndexRef.current++;
+            const nextCmd = history[historyIndexRef.current] || '';
+            while (currentLineRef.current.length > 0) {
+              term.write('\b \b');
+              currentLineRef.current = currentLineRef.current.slice(0, -1);
+            }
+            currentLineRef.current = nextCmd;
+            term.write(nextCmd);
+          } else {
+            historyIndexRef.current = -1;
+            while (currentLineRef.current.length > 0) {
+              term.write('\b \b');
+              currentLineRef.current = currentLineRef.current.slice(0, -1);
+            }
+          }
+          return;
+        }
+
+        if (data >= ' ' || data.charCodeAt(0) > 127) {
+          currentLineRef.current += data;
+          term.write(data);
+        }
+      });
+    }
+
     const resizeObserver = new ResizeObserver(() => {
       try {
         fitAddon.fit();
@@ -156,24 +395,23 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ config, onDisconnect
     resizeObserver.observe(containerRef.current);
 
     return () => {
-      onDataDisposable.dispose();
-      onResizeDisposable.dispose();
+      onDataDisposable?.dispose();
+      onResizeDisposable?.dispose();
       resizeObserver.disconnect();
-      if (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING) {
+      if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
         ws.close();
       }
       term.dispose();
     };
-  }, [config]);
+  }, [terminalMode, currentSSHConfig, reconnectCounter]);
 
   // Handle Theme or Font Size Changes
   useEffect(() => {
     if (!terminalRef.current) return;
-
-    const themeObj = TERMINAL_THEMES.find((t) => t.id === themeId)?.theme || TERMINAL_THEMES[0].theme;
+    const themeObj =
+      TERMINAL_THEMES.find((t) => t.id === themeId)?.theme || TERMINAL_THEMES[0].theme;
     terminalRef.current.options.theme = themeObj;
     terminalRef.current.options.fontSize = fontSize;
-
     if (fitAddonRef.current) {
       try {
         fitAddonRef.current.fit();
@@ -181,194 +419,310 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ config, onDisconnect
     }
   }, [themeId, fontSize]);
 
-  const sendCommand = (cmd: string) => {
-    if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
-      wsRef.current.send(JSON.stringify({ type: 'input', data: cmd.endsWith('\r') ? cmd : cmd + '\r' }));
-      if (terminalRef.current) {
-        terminalRef.current.focus();
+  // Handle Connect to External SSH
+  const handleConnectSSH = (e?: React.FormEvent) => {
+    if (e) e.preventDefault();
+    if (!host.trim() || !username.trim()) {
+      alert('لطفاً آدرس IP سرور و نام کاربری را وارد فرمایید.');
+      return;
+    }
+
+    const newConfig: SSHConfig = {
+      id: currentSSHConfig?.id || `ssh-${Date.now()}`,
+      name: currentSSHConfig?.name || `${username}@${host}`,
+      host: host.trim(),
+      port: Number(port) || 22,
+      username: username.trim(),
+      authType,
+      password,
+      privateKey,
+    };
+
+    setCurrentSSHConfig(newConfig);
+    setTerminalMode('ssh');
+    setShowConnectBar(false);
+    setReconnectCounter((c) => c + 1);
+
+    if (onConnectRemote) {
+      onConnectRemote(newConfig);
+    }
+    if (saveToHistory && onSaveConfig) {
+      onSaveConfig(newConfig);
+    }
+  };
+
+  // Test Connection
+  const handleTestConnection = async () => {
+    if (!host.trim() || !username.trim()) {
+      setTestResult({
+        success: false,
+        message: 'لطفاً آدرس سرور و نام کاربری را وارد کنید.',
+      });
+      return;
+    }
+
+    setTestTesting(true);
+    setTestResult(null);
+
+    const testCfg: SSHConfig = {
+      name: `${username.trim()}@${host.trim()}`,
+      host: host.trim(),
+      port: Number(port) || 22,
+      username: username.trim(),
+      authType,
+      password,
+      privateKey,
+    };
+
+    try {
+      const res = await fetch('/api/ssh/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(testCfg),
+      });
+      const data = await res.json();
+      setTestResult(data);
+    } catch (err: any) {
+      setTestResult({
+        success: false,
+        message: err.message || 'خطا در ارتباط با سرور',
+      });
+    } finally {
+      setTestTesting(false);
+    }
+  };
+
+  // Execute line or command directly
+  const runCommandLine = async (cmd: string) => {
+    const term = terminalRef.current;
+    if (!term) return;
+
+    if (terminalMode === 'ssh') {
+      if (wsRef.current && wsRef.current.readyState === WebSocket.OPEN) {
+        wsRef.current.send(
+          JSON.stringify({ type: 'input', data: cmd.endsWith('\r') ? cmd : cmd + '\r' })
+        );
+        term.focus();
+      } else {
+        setShowConnectBar(true);
       }
+    } else {
+      const shell = shellRef.current;
+      while (currentLineRef.current.length > 0) {
+        term.write('\b \b');
+        currentLineRef.current = currentLineRef.current.slice(0, -1);
+      }
+      term.writeln(cmd);
+      const output = await shell.execute(cmd);
+      if (output) term.write(output);
+      term.write(shell.getPrompt());
+      term.focus();
     }
   };
 
   const handleQuickSubmit = (e: React.FormEvent) => {
     e.preventDefault();
     if (!quickInput.trim()) return;
-    sendCommand(quickInput);
+    runCommandLine(quickInput.trim());
     setQuickInput('');
   };
 
   const sendControlKey = (key: string) => {
-    if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
-    if (key === 'ctrl-c') {
-      wsRef.current.send(JSON.stringify({ type: 'input', data: '\x03' }));
-    } else if (key === 'ctrl-z') {
-      wsRef.current.send(JSON.stringify({ type: 'input', data: '\x1a' }));
-    } else if (key === 'tab') {
-      wsRef.current.send(JSON.stringify({ type: 'input', data: '\t' }));
-    } else if (key === 'clear') {
-      terminalRef.current?.clear();
+    const term = terminalRef.current;
+    if (!term) return;
+
+    if (terminalMode === 'ssh') {
+      if (!wsRef.current || wsRef.current.readyState !== WebSocket.OPEN) return;
+      if (key === 'ctrl-c') {
+        wsRef.current.send(JSON.stringify({ type: 'input', data: '\x03' }));
+      } else if (key === 'ctrl-z') {
+        wsRef.current.send(JSON.stringify({ type: 'input', data: '\x1a' }));
+      } else if (key === 'tab') {
+        wsRef.current.send(JSON.stringify({ type: 'input', data: '\t' }));
+      } else if (key === 'clear') {
+        wsRef.current.send(JSON.stringify({ type: 'input', data: 'clear\r' }));
+      }
+    } else {
+      const shell = shellRef.current;
+      if (key === 'ctrl-c') {
+        term.writeln('^C');
+        currentLineRef.current = '';
+        term.write(shell.getPrompt());
+      } else if (key === 'clear') {
+        term.clear();
+        term.write(shell.getPrompt() + currentLineRef.current);
+      } else if (key === 'tab') {
+        const suggestions = shell.getCompletions(currentLineRef.current);
+        if (suggestions.length > 0) {
+          term.writeln('');
+          term.writeln(suggestions.map((s) => `\x1b[36m${s}\x1b[0m`).join('    '));
+          term.write(shell.getPrompt() + currentLineRef.current);
+        }
+      }
+      term.focus();
     }
   };
 
-  const reconnect = () => {
-    setStatus('connecting');
-    setStatusMessage('در حال اتصال مجدد...');
+  const handleDisconnect = () => {
     if (wsRef.current) {
       wsRef.current.close();
     }
-    // Force re-mount by triggering a slight change or refreshing component logic
-    if (terminalRef.current) {
-      terminalRef.current.clear();
+    setStatus('closed');
+    setStatusMessage('ارتباط با سرور خارجی قطع شد');
+    if (onDisconnect) {
+      onDisconnect();
     }
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/ws/ssh`;
-    const ws = new WebSocket(wsUrl);
-    wsRef.current = ws;
-
-    ws.onopen = () => {
-      if (terminalRef.current) {
-        ws.send(
-          JSON.stringify({
-            type: 'init',
-            config,
-            cols: terminalRef.current.cols,
-            rows: terminalRef.current.rows,
-          })
-        );
-      }
-    };
-
-    ws.onmessage = (event) => {
-      try {
-        const msg = JSON.parse(event.data);
-        if (msg.type === 'output') terminalRef.current?.write(msg.data);
-        else if (msg.type === 'status') {
-          if (msg.status === 'connected') {
-            setStatus('connected');
-            setStatusMessage('اتصال برقرار شد');
-          } else if (msg.status === 'closed') {
-            setStatus('closed');
-            setStatusMessage(msg.message);
-          }
-        } else if (msg.type === 'error') {
-          setStatus('error');
-          setStatusMessage(msg.message);
-        }
-      } catch (e) {}
-    };
   };
 
   return (
     <div
-      className={`flex flex-col bg-slate-950 text-slate-100 rounded-xl border border-slate-800 shadow-2xl overflow-hidden transition-all duration-200 ${
-        isFullscreen ? 'fixed inset-0 z-50 rounded-none border-none' : 'w-full h-[650px]'
+      className={`flex flex-col bg-white text-slate-800 rounded-2xl border border-slate-200 shadow-sm overflow-hidden transition-all duration-200 ${
+        isFullscreen ? 'fixed inset-0 z-50 rounded-none border-none' : 'w-full h-[700px]'
       }`}
     >
-      {/* Terminal Toolbar */}
-      <div className="flex flex-wrap items-center justify-between gap-2 px-4 py-3 bg-slate-900/90 border-b border-slate-800 text-xs select-none">
-        <div className="flex items-center gap-3">
-          <div className="flex items-center gap-2 font-mono font-semibold">
-            <span
-              className="w-3 h-3 rounded-full flex-shrink-0"
-              style={{ backgroundColor: config.color || '#3b82f6' }}
-            />
-            <span className="text-slate-200">{config.name}</span>
-            <span className="text-slate-500 font-normal">
-              ({config.username}@{config.host}:{config.port || 22})
-            </span>
+      {/* Top Main Toolbar */}
+      <div className="flex flex-wrap items-center justify-between gap-3 px-4 py-2.5 bg-slate-50/90 border-b border-slate-200 text-xs select-none">
+        {/* Left Side: Mode Selection & Connection Status */}
+        <div className="flex items-center flex-wrap gap-2.5">
+          {/* Live External SSH Badge */}
+          <div className="flex items-center bg-blue-50 border border-blue-200 px-3 py-1.5 rounded-lg text-blue-700 font-semibold text-xs gap-1.5 shadow-xs">
+            <Server className="w-3.5 h-3.5 text-blue-600" />
+            <span>ترمینال خارجی زنده (Live SSH)</span>
           </div>
 
-          {/* Status Badge */}
-          <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] font-medium bg-slate-800/80 border border-slate-700/50">
-            {status === 'connected' && (
+          {/* Quick Connect Drawer Toggle */}
+          <button
+            onClick={() => setShowConnectBar(!showConnectBar)}
+            className={`px-3 py-1.5 rounded-lg border text-xs font-semibold flex items-center gap-1.5 transition-all cursor-pointer ${
+              showConnectBar
+                ? 'bg-white border-slate-300 text-slate-800 shadow-xs'
+                : 'bg-white/80 border-slate-200 hover:border-slate-300 text-slate-700'
+            }`}
+          >
+            <Radio className="w-3.5 h-3.5 text-blue-600 animate-pulse" />
+            <span>تنظیمات و اتصال سرور</span>
+            {showConnectBar ? <ChevronUp className="w-3 h-3" /> : <ChevronDown className="w-3 h-3" />}
+          </button>
+
+          {/* Real-time Status Badge */}
+          <div className="hidden lg:flex items-center gap-2 px-2.5 py-1 rounded-full text-[11px] font-medium bg-white border border-slate-200 shadow-xs">
+            {terminalMode === 'ssh' ? (
+              status === 'connected' ? (
+                <>
+                  <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+                  <span className="text-emerald-700 font-mono dir-ltr">
+                    {currentSSHConfig?.username}@{currentSSHConfig?.host}:{currentSSHConfig?.port || 22}
+                  </span>
+                  {latency && (
+                    <span className="text-[10px] text-slate-600 bg-slate-100 px-1.5 py-0.5 rounded font-mono">
+                      {latency}ms
+                    </span>
+                  )}
+                </>
+              ) : status === 'connecting' ? (
+                <>
+                  <span className="w-2 h-2 rounded-full bg-amber-500 animate-ping" />
+                  <span className="text-amber-700">در حال اتصال SSH...</span>
+                </>
+              ) : (
+                <>
+                  <span className="w-2 h-2 rounded-full bg-slate-400" />
+                  <span className="text-slate-500">سرور قطع است</span>
+                </>
+              )
+            ) : (
               <>
                 <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-                <span className="text-emerald-400">متصل</span>
-              </>
-            )}
-            {status === 'connecting' && (
-              <>
-                <span className="w-2 h-2 rounded-full bg-amber-500 animate-ping" />
-                <span className="text-amber-400">در حال اتصال...</span>
-              </>
-            )}
-            {(status === 'closed' || status === 'error') && (
-              <>
-                <span className="w-2 h-2 rounded-full bg-rose-500" />
-                <span className="text-rose-400">{status === 'error' ? 'خطا' : 'قطع شده'}</span>
+                <span className="text-emerald-700">شبیه‌ساز فعال</span>
               </>
             )}
           </div>
         </div>
 
-        {/* Action Controls */}
+        {/* Right Side: Reconnect, Controls, Themes, Fullscreen */}
         <div className="flex items-center gap-1.5">
+          {terminalMode === 'ssh' && currentSSHConfig && (
+            <>
+              <button
+                onClick={() => setReconnectCounter((c) => c + 1)}
+                className="p-1.5 rounded-lg bg-white hover:bg-slate-100 text-slate-600 border border-slate-200 transition-colors cursor-pointer"
+                title="اتصال مجدد به سرور خارجی"
+              >
+                <RefreshCw className="w-3.5 h-3.5 text-blue-600" />
+              </button>
+
+              {status === 'connected' && (
+                <button
+                  onClick={handleDisconnect}
+                  className="px-2.5 py-1 rounded-lg bg-rose-50 hover:bg-rose-100 text-rose-700 border border-rose-200 text-xs flex items-center gap-1 cursor-pointer"
+                  title="قطع اتصال سرور"
+                >
+                  <Power className="w-3 h-3" />
+                  <span className="hidden sm:inline">قطع</span>
+                </button>
+              )}
+            </>
+          )}
+
           {/* Quick Macros Dropdown */}
           <div className="relative">
             <button
               onClick={() => setShowMacrosMenu(!showMacrosMenu)}
-              className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-emerald-950/60 hover:bg-emerald-900/60 text-emerald-300 border border-emerald-800/50 transition-colors"
-              title="دستورات آماده"
+              className="flex items-center gap-1 px-2.5 py-1.5 rounded-lg bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 transition-colors cursor-pointer"
+              title="دستورات آماده سرور"
             >
-              <Zap className="w-3.5 h-3.5" />
-              <span>دستورات سریع</span>
+              <Zap className="w-3.5 h-3.5 text-blue-600" />
+              <span className="hidden sm:inline font-medium">دستورات سریع</span>
             </button>
 
             {showMacrosMenu && (
-              <div className="absolute right-0 mt-2 w-72 bg-slate-900 border border-slate-700 rounded-xl shadow-2xl z-50 p-2 space-y-1">
-                <div className="px-2 py-1 text-[11px] font-semibold text-slate-400 border-b border-slate-800 mb-1">
-                  دستورات پرکاربرد سیستم
+              <div className="absolute right-0 mt-2 w-72 bg-white border border-slate-200 rounded-xl shadow-xl z-50 p-2 space-y-1">
+                <div className="px-2 py-1 text-[11px] font-semibold text-slate-400 border-b border-slate-100 mb-1">
+                  دستورات لایو سرور لینوکس
                 </div>
                 {DEFAULT_QUICK_MACROS.map((macro) => (
                   <button
                     key={macro.id}
                     onClick={() => {
-                      sendCommand(macro.command);
+                      runCommandLine(macro.command);
                       setShowMacrosMenu(false);
                     }}
-                    className="w-full text-right px-2.5 py-1.5 rounded-lg hover:bg-slate-800 text-slate-200 transition-colors text-xs flex flex-col gap-0.5"
+                    className="w-full text-right px-2.5 py-1.5 rounded-lg hover:bg-slate-50 text-slate-700 transition-colors text-xs flex flex-col gap-0.5 cursor-pointer"
                   >
                     <div className="flex items-center justify-between font-medium">
                       <span>{macro.title}</span>
-                      <Play className="w-3 h-3 text-emerald-400" />
+                      <Play className="w-3 h-3 text-blue-600" />
                     </div>
-                    <span className="text-[10px] text-slate-400 font-mono truncate">{macro.command}</span>
+                    <span className="text-[10px] text-slate-400 font-mono truncate dir-ltr text-left">
+                      {macro.command}
+                    </span>
                   </button>
                 ))}
               </div>
             )}
           </div>
 
-          {/* Special Key Buttons */}
+          {/* Special Control Keys */}
           <button
             onClick={() => sendControlKey('ctrl-c')}
-            className="px-2 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors font-mono font-bold text-[11px]"
-            title="ارسال کلید Ctrl + C (توقف دستور)"
+            className="px-2 py-1.5 rounded-lg bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 transition-colors font-mono font-bold text-[11px] cursor-pointer"
+            title="Ctrl + C (توقف دستور)"
           >
             Ctrl+C
           </button>
           <button
-            onClick={() => sendControlKey('ctrl-z')}
-            className="px-2 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors font-mono font-bold text-[11px]"
-            title="ارسال کلید Ctrl + Z"
-          >
-            Ctrl+Z
-          </button>
-          <button
             onClick={() => sendControlKey('tab')}
-            className="px-2 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors font-mono text-[11px]"
-            title="کلید Tab (تکمیل خودکار)"
+            className="px-2 py-1.5 rounded-lg bg-white hover:bg-slate-100 text-slate-700 border border-slate-200 transition-colors font-mono text-[11px] cursor-pointer"
+            title="Tab"
           >
             Tab
           </button>
-
-          <div className="h-4 w-[1px] bg-slate-800 mx-1" />
 
           {/* Theme Selector */}
           <select
             value={themeId}
             onChange={(e) => setThemeId(e.target.value)}
-            className="bg-slate-800 text-slate-300 px-2 py-1.5 rounded border border-slate-700 text-xs focus:outline-none"
+            className="bg-white text-slate-700 px-2.5 py-1.5 rounded-lg border border-slate-200 text-xs focus:outline-none cursor-pointer"
           >
             {TERMINAL_THEMES.map((t) => (
               <option key={t.id} value={t.id}>
@@ -377,20 +731,18 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ config, onDisconnect
             ))}
           </select>
 
-          {/* Font Size Adjuster */}
-          <div className="flex items-center bg-slate-800 rounded border border-slate-700">
+          {/* Font Size */}
+          <div className="hidden sm:flex items-center bg-white rounded-lg border border-slate-200">
             <button
               onClick={() => setFontSize((s) => Math.max(10, s - 1))}
-              className="px-2 py-1 text-slate-400 hover:text-white"
-              title="کاهش اندازه‌فونت"
+              className="px-2 py-1 text-slate-500 hover:text-slate-800 cursor-pointer"
             >
               -
             </button>
-            <span className="px-1 font-mono text-[11px] text-slate-300">{fontSize}px</span>
+            <span className="px-1 font-mono text-[11px] text-slate-700">{fontSize}px</span>
             <button
-              onClick={() => setFontSize((s) => Math.min(24, s + 1))}
-              className="px-2 py-1 text-slate-400 hover:text-white"
-              title="افزایش اندازه‌فونت"
+              onClick={() => setFontSize((s) => Math.min(22, s + 1))}
+              className="px-2 py-1 text-slate-500 hover:text-slate-800 cursor-pointer"
             >
               +
             </button>
@@ -398,98 +750,220 @@ export const TerminalView: React.FC<TerminalViewProps> = ({ config, onDisconnect
 
           <button
             onClick={() => sendControlKey('clear')}
-            className="p-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors"
-            title="پاک‌سازی ترمینال"
+            className="p-1.5 rounded-lg bg-white hover:bg-slate-100 text-slate-600 border border-slate-200 transition-colors cursor-pointer"
+            title="پاک‌سازی صفحه"
           >
             <Trash2 className="w-3.5 h-3.5" />
           </button>
 
           <button
-            onClick={reconnect}
-            className="p-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors"
-            title="اتصال مجدد"
-          >
-            <RefreshCw className="w-3.5 h-3.5" />
-          </button>
-
-          <button
             onClick={() => setIsFullscreen(!isFullscreen)}
-            className="p-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-300 transition-colors"
-            title={isFullscreen ? 'خروج از تمام‌صفحه' : 'حالت تمام‌صفحه'}
+            className="p-1.5 rounded-lg bg-white hover:bg-slate-100 text-slate-600 border border-slate-200 transition-colors cursor-pointer"
+            title={isFullscreen ? 'خروج از تمام‌صفحه' : 'تمام‌صفحه'}
           >
             {isFullscreen ? <Minimize2 className="w-3.5 h-3.5" /> : <Maximize2 className="w-3.5 h-3.5" />}
           </button>
         </div>
       </div>
 
-      {/* Terminal Container */}
-      <div className="flex-1 w-full relative bg-slate-950 p-2 overflow-hidden dir-ltr">
-        <div ref={containerRef} className="w-full h-full" />
+      {/* QUICK CONNECT BAR FOR LIVE EXTERNAL SSH (Slide-down drawer) */}
+      {showConnectBar && (
+        <div className="bg-slate-50/95 border-b border-slate-200 p-4 shadow-sm transition-all dir-rtl">
+          <form onSubmit={handleConnectSSH} className="space-y-3">
+            <div className="flex items-center justify-between">
+              <div className="flex items-center gap-2 text-xs font-bold text-slate-800">
+                <Globe className="w-4 h-4 text-blue-600" />
+                <span>مشخصات اتصال لایو به سرور خارجی (Live External SSH)</span>
+              </div>
 
-        {status === 'closed' && (
-          <div className="absolute inset-0 bg-slate-950/80 backdrop-blur-xs flex flex-col items-center justify-center p-6 text-center z-10 dir-rtl">
-            <div className="p-3 bg-amber-500/10 border border-amber-500/20 rounded-full mb-3 text-amber-400">
-              <AlertTriangle className="w-8 h-8" />
-            </div>
-            <h3 className="text-lg font-bold text-slate-100 mb-1">اتصال SSH پایان یافت</h3>
-            <p className="text-xs text-slate-400 mb-4">{statusMessage}</p>
-            <button
-              onClick={reconnect}
-              className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold flex items-center gap-2 shadow-lg transition-colors"
-            >
-              <RefreshCw className="w-4 h-4" />
-              <span>اتصال دوباره به سرور</span>
-            </button>
-          </div>
-        )}
-
-        {status === 'error' && (
-          <div className="absolute inset-0 bg-slate-950/90 backdrop-blur-xs flex flex-col items-center justify-center p-6 text-center z-10 dir-rtl">
-            <div className="p-3 bg-rose-500/10 border border-rose-500/20 rounded-full mb-3 text-rose-400">
-              <AlertTriangle className="w-8 h-8" />
-            </div>
-            <h3 className="text-lg font-bold text-rose-300 mb-1">خطا در برقراری ارتباط SSH</h3>
-            <p className="text-xs text-slate-400 max-w-md mb-4 bg-slate-900 p-3 rounded border border-slate-800 font-mono dir-ltr">
-              {statusMessage}
-            </p>
-            <div className="flex gap-2">
-              <button
-                onClick={reconnect}
-                className="px-4 py-2 bg-emerald-600 hover:bg-emerald-500 text-white rounded-lg text-xs font-semibold flex items-center gap-2 transition-colors"
-              >
-                <RefreshCw className="w-4 h-4" />
-                <span>تلاش مجدد</span>
-              </button>
-              {onDisconnect && (
-                <button
-                  onClick={onDisconnect}
-                  className="px-4 py-2 bg-slate-800 hover:bg-slate-700 text-slate-300 rounded-lg text-xs transition-colors"
-                >
-                  تغییر تنظیمات سرور
-                </button>
+              {/* Saved Presets Shortcut */}
+              {savedConfigs.length > 0 && (
+                <div className="flex items-center gap-1.5">
+                  <span className="text-[11px] text-slate-500">سرورهای ذخیره‌شده:</span>
+                  <select
+                    onChange={(e) => {
+                      const selected = savedConfigs.find((c) => c.id === e.target.value);
+                      if (selected) {
+                        setHost(selected.host);
+                        setPort(selected.port || 22);
+                        setUsername(selected.username);
+                        setAuthType(selected.authType || 'password');
+                        setPassword(selected.password || '');
+                        setPrivateKey(selected.privateKey || '');
+                        setCurrentSSHConfig(selected);
+                      }
+                    }}
+                    className="bg-white border border-slate-200 text-slate-700 text-xs rounded-lg px-2 py-1 focus:outline-none cursor-pointer"
+                  >
+                    <option value="">-- انتخاب از لیست --</option>
+                    {savedConfigs.map((c) => (
+                      <option key={c.id} value={c.id}>
+                        {c.name} ({c.username}@{c.host})
+                      </option>
+                    ))}
+                  </select>
+                </div>
               )}
             </div>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-5 gap-2.5">
+              {/* Host / IP */}
+              <div className="md:col-span-2">
+                <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                  آدرس IP سرور یا دامنه (Host):
+                </label>
+                <div className="relative">
+                  <input
+                    type="text"
+                    value={host}
+                    onChange={(e) => setHost(e.target.value)}
+                    placeholder="مثال: 194.31.55.102 یا vps.example.com"
+                    required
+                    className="w-full bg-white border border-slate-300 rounded-lg px-3 py-1.5 text-xs text-slate-800 font-mono dir-ltr focus:outline-none focus:border-blue-500"
+                  />
+                </div>
+              </div>
+
+              {/* Port */}
+              <div>
+                <label className="block text-[11px] font-semibold text-slate-600 mb-1">پورت SSH:</label>
+                <input
+                  type="number"
+                  value={port}
+                  onChange={(e) => setPort(Number(e.target.value))}
+                  placeholder="22"
+                  className="w-full bg-white border border-slate-300 rounded-lg px-3 py-1.5 text-xs text-slate-800 font-mono dir-ltr focus:outline-none focus:border-blue-500"
+                />
+              </div>
+
+              {/* Username */}
+              <div>
+                <label className="block text-[11px] font-semibold text-slate-600 mb-1">نام کاربری:</label>
+                <input
+                  type="text"
+                  value={username}
+                  onChange={(e) => setUsername(e.target.value)}
+                  placeholder="root یا ubuntu"
+                  required
+                  className="w-full bg-white border border-slate-300 rounded-lg px-3 py-1.5 text-xs text-slate-800 font-mono dir-ltr focus:outline-none focus:border-blue-500"
+                />
+              </div>
+
+              {/* Password or Key */}
+              <div>
+                <label className="block text-[11px] font-semibold text-slate-600 mb-1">
+                  {authType === 'password' ? 'رمز عبور (Password):' : 'کلید خصوصی (PEM):'}
+                </label>
+                <div className="relative">
+                  <input
+                    type={showPassword ? 'text' : 'password'}
+                    value={password}
+                    onChange={(e) => setPassword(e.target.value)}
+                    placeholder="رمز ورود سرور..."
+                    className="w-full bg-white border border-slate-300 rounded-lg px-3 py-1.5 text-xs text-slate-800 font-mono dir-ltr focus:outline-none focus:border-blue-500 pl-8"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowPassword(!showPassword)}
+                    className="absolute left-2 top-2 text-slate-400 hover:text-slate-600"
+                  >
+                    {showPassword ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                  </button>
+                </div>
+              </div>
+            </div>
+
+            {/* Buttons Row */}
+            <div className="flex flex-wrap items-center justify-between gap-3 pt-2 border-t border-slate-200">
+              <div className="flex items-center gap-3">
+                <button
+                  type="submit"
+                  className="px-5 py-2 bg-blue-600 hover:bg-blue-700 text-white rounded-lg text-xs font-bold flex items-center gap-2 shadow-xs transition-all cursor-pointer"
+                >
+                  <Server className="w-4 h-4 text-white" />
+                  <span>اتصال لایو به سرور خارجی</span>
+                </button>
+
+                <button
+                  type="button"
+                  onClick={handleTestConnection}
+                  disabled={testTesting || !host.trim()}
+                  className="px-3.5 py-2 bg-white hover:bg-slate-100 border border-slate-200 disabled:opacity-50 text-slate-700 rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors cursor-pointer"
+                >
+                  {testTesting ? <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-600" /> : <ShieldCheck className="w-3.5 h-3.5 text-emerald-600" />}
+                  <span>تست آنلاین پورت ۲۲</span>
+                </button>
+              </div>
+
+              {testResult && (
+                <div
+                  className={`text-xs px-3 py-1.5 rounded-lg flex items-center gap-1.5 ${
+                    testResult.success
+                      ? 'bg-emerald-50 text-emerald-800 border border-emerald-200'
+                      : 'bg-rose-50 text-rose-800 border border-rose-200'
+                  }`}
+                >
+                  {testResult.success ? <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" /> : <AlertTriangle className="w-3.5 h-3.5 text-rose-600" />}
+                  <span>{testResult.message}</span>
+                  {testResult.latencyMs && <span className="font-mono font-bold">({testResult.latencyMs}ms)</span>}
+                </div>
+              )}
+            </div>
+          </form>
+        </div>
+      )}
+
+      {/* Terminal Viewport */}
+      <div className="flex-1 w-full relative bg-slate-50/50 p-2 overflow-hidden dir-ltr">
+        <div ref={containerRef} className="w-full h-full" />
+
+        {/* Overlay when SSH Disconnected & No Config */}
+        {terminalMode === 'ssh' && !currentSSHConfig && (
+          <div className="absolute inset-0 bg-white/95 backdrop-blur-xs flex flex-col items-center justify-center p-6 text-center z-10 dir-rtl">
+            <div className="w-14 h-14 bg-blue-50 border border-blue-100 rounded-2xl flex items-center justify-center mb-4 text-blue-600 shadow-xs">
+              <Server className="w-7 h-7" />
+            </div>
+            <h3 className="text-base font-bold text-slate-800 mb-1">
+              اتصال زنده به سرور خارجی (Live Remote SSH)
+            </h3>
+            <p className="text-xs text-slate-500 max-w-lg mb-5 leading-relaxed">
+              با وارد کردن آدرس IP سرور لینوکس، پورت و رمز عبور در کادر بالا، ترمینال خط‌به‌خط و بلادرنگ به سرور شما وصل می‌شود و خروجی کامل شل، bash، دستورات سیستم و ویرایشگرها را زنده استریم می‌کند.
+            </p>
+            <button
+              onClick={() => setShowConnectBar(true)}
+              className="px-6 py-2.5 bg-blue-600 hover:bg-blue-700 text-white rounded-xl text-xs font-bold flex items-center gap-2 shadow-xs transition-all cursor-pointer"
+            >
+              <Server className="w-4 h-4" />
+              <span>باز کردن فرم اتصال سریع سرور</span>
+            </button>
           </div>
         )}
       </div>
 
       {/* Quick Interactive Command Input Bar */}
-      <form onSubmit={handleQuickSubmit} className="flex items-center gap-2 p-2 bg-slate-900 border-t border-slate-800 dir-rtl">
-        <div className="flex items-center gap-1 text-xs text-slate-400 font-mono px-2">
-          <TerminalIcon className="w-3.5 h-3.5 text-emerald-400" />
-          <span>ارسال دستور:</span>
+      <form
+        onSubmit={handleQuickSubmit}
+        className="flex items-center gap-2 p-2.5 bg-white border-t border-slate-200 dir-rtl"
+      >
+        <div className="flex items-center gap-1.5 text-xs text-slate-500 font-mono px-2">
+          <TerminalIcon className="w-4 h-4 text-blue-600" />
+          <span className="hidden sm:inline font-sans text-slate-700 font-medium">ارسال خط فرمان:</span>
         </div>
         <input
           type="text"
           value={quickInput}
           onChange={(e) => setQuickInput(e.target.value)}
-          placeholder="دستور را تایپ کرده و Enter بزنید (مانند: htop, docker ps, ls -l)..."
-          className="flex-1 bg-slate-950 border border-slate-800 rounded px-3 py-1.5 text-xs text-slate-100 font-mono focus:outline-none focus:border-emerald-500 dir-ltr"
+          placeholder={
+            terminalMode === 'ssh'
+              ? 'دستور زنده برای سرور خارجی را وارد کنید (مثال: htop, docker ps, uname -a, apt update)...'
+              : 'دستور لینوکس برای ترمینال وب (مثال: help, neofetch, ls -la, ping google.com)...'
+          }
+          className="flex-1 bg-slate-50 border border-slate-300 rounded-lg px-3 py-2 text-xs text-slate-800 font-mono focus:outline-none focus:border-blue-500 focus:bg-white dir-ltr placeholder:text-slate-400"
         />
         <button
           type="submit"
-          disabled={status !== 'connected'}
-          className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 disabled:opacity-40 text-white rounded text-xs font-medium flex items-center gap-1 transition-colors"
+          disabled={!quickInput.trim()}
+          className="px-4 py-2 bg-blue-600 hover:bg-blue-700 disabled:opacity-40 text-white rounded-lg text-xs font-semibold flex items-center gap-1.5 transition-colors shadow-xs cursor-pointer"
         >
           <Send className="w-3.5 h-3.5" />
           <span>ارسال</span>

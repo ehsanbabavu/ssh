@@ -1,6 +1,6 @@
 {
-  "name": "Web SSH Terminal",
-  "description": "A modern web-based SSH client to connect to remote servers, execute commands in real time, run scripts, monitor server stats, and manage files via SFTP.",
+  "name": "ترمینال SSH و مدیریت سرور لینوکس",
+  "description": "سامانه مدرن تحت وب مدیریت و ترمینال آنلاین SSH، اجرای دستورات، انتقال فایل SFTP و پایش سرور لینوکس",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }
